@@ -64,6 +64,43 @@ is attempted once the limit is reached.
 
 Set `KESTREL_LOG=info` (or `debug`) for logs on stderr.
 
+## What it costs to post
+
+Since February 2026, X API is **pay-per-use** — no free tier, no subscriptions for new
+developers. You prepay credits and every API call costs money.
+
+| Operation | Price |
+|---|---|
+| Post a tweet (plain text, no URL) | $0.015 |
+| Post a tweet containing a URL | **$0.200** (13× more) |
+| Post a summoned reply | $0.010 |
+| Read a post | $0.005 |
+| Read your own data (owned read) | $0.001 |
+| Delete a post | $0.010 |
+
+Caps: 3 million post reads per monthly billing cycle, and 100 posts per 15 minutes
+per user (X's rate limit, not Kestrel's).
+
+**What this means in practice:**
+
+| Monthly volume | Plain text | With links (30%) |
+|---|---|---|
+| 1 post/day | $0.45 | $1.80 |
+| 3 posts/day | $1.35 | $5.40 |
+| 10 posts/day | $4.50 | $18.00 |
+| 50 posts/day | $22.50 | $90.00 |
+| 100 posts/day | $45.00 | $180.00 |
+
+The link surcharge dominates fast. A single post with a URL costs more than 13 plain
+posts. Where possible, put the link in a summoned reply ($0.010) instead.
+
+Kestrel's built-in daily limit is your safety net on top of this: it stops runaway
+agent posting before your credit card notices.
+
+**Buying credits:** Log into the [X Developer Console](https://developer.x.com),
+pick your app, and add credits under the billing section. You set a spending limit;
+X deducts per call. When credits hit zero you get HTTP 402.
+
 ## Daily limit
 
 Usage is tracked in `~/.config/kestrel/state.json`:
