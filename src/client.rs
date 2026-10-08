@@ -1,5 +1,7 @@
-//! X API v2 client: OAuth 1.0a (HMAC-SHA1) request signing + `POST /2/tweets`.
+//! X API v2 client: OAuth 1.0a (HMAC-SHA1) request signing + `POST /2/tweets`,
+//! plus image upload via the v1.1 media endpoint.
 
+use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -13,6 +15,7 @@ use crate::config::Config;
 use crate::rate_limiter::{RateLimiter, State};
 
 pub const TWEETS_URL: &str = "https://api.x.com/2/tweets";
+pub const MEDIA_UPLOAD_URL: &str = "https://upload.x.com/1.1/media/upload.json";
 
 #[derive(Debug, Clone)]
 pub struct Tweet {
@@ -41,7 +44,8 @@ impl XClient {
         Ok(Self { http, config })
     }
 
-    pub async fn post_tweet(&self, text: &str) -> Result<Tweet> {
+    /// Post a tweet, optionally attaching media previously returned by [`Self::upload_media`].
+    pub async fn post_tweet(&self, text: &str, media_ids: Option<&[String]>) -> Result<Tweet> {
         if text.trim().is_empty() {
             bail!("tweet text is empty");
         }
@@ -58,25 +62,11 @@ impl XClient {
             .http
             .post(TWEETS_URL)
             .header(header::AUTHORIZATION, auth)
-            .json(&serde_json::json!({ "text": text }))
+            .json(&tweet_body(text, media_ids))
             .send()
             .await
             .map_err(|e| anyhow!("network error contacting X API: {e}"))?;
-
-        let status = response.status();
-        let reset = response
-            .headers()
-            .get("x-rate-limit-reset")
-            .and_then(|v| v.to_str().ok())
-            .map(str::to_owned);
-        let body = response
-            .text()
-            .await
-            .map_err(|e| anyhow!("network error reading X API response: {e}"))?;
-
-        if !status.is_success() {
-            return Err(api_error(status, &body, reset.as_deref()));
-        }
+        let body = read_body(response).await?;
 
         let parsed: CreateTweetResponse = serde_json::from_str(&body)
             .with_context(|| format!("unexpected X API response: {body}"))?;
@@ -84,6 +74,102 @@ impl XClient {
             id: parsed.data.id,
             text: parsed.data.text,
         })
+    }
+
+    /// Upload an image file and return its `media_id_string` for use in [`Self::post_tweet`].
+    ///
+    /// The body is multipart, so (as with JSON) it is not part of the OAuth signature.
+    pub async fn upload_media(&self, image_path: &str) -> Result<String> {
+        let path = Path::new(image_path);
+        let bytes = tokio::fs::read(path).await.map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                anyhow!("image file not found: {image_path}")
+            } else {
+                anyhow!("failed to read image file {image_path}: {e}")
+            }
+        })?;
+        if bytes.is_empty() {
+            bail!("image file is empty: {image_path}");
+        }
+
+        let file_name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("image")
+            .to_owned();
+        let mut part = reqwest::multipart::Part::bytes(bytes).file_name(file_name);
+        if let Some(mime) = image_mime_type(path) {
+            part = part
+                .mime_str(mime)
+                .context("failed to set image content type")?;
+        }
+        let form = reqwest::multipart::Form::new().part("media", part);
+
+        let auth = authorization_header(
+            "POST",
+            MEDIA_UPLOAD_URL,
+            &self.config,
+            &generate_nonce(),
+            &unix_timestamp()?,
+        )?;
+
+        let response = self
+            .http
+            .post(MEDIA_UPLOAD_URL)
+            .header(header::AUTHORIZATION, auth)
+            .multipart(form)
+            .send()
+            .await
+            .map_err(|e| anyhow!("network error uploading media to X: {e}"))?;
+        let body = read_body(response)
+            .await
+            .context("media upload failed")?;
+        parse_media_id(&body)
+    }
+}
+
+/// Read a response body, turning non-2xx statuses into a descriptive X API error.
+async fn read_body(response: reqwest::Response) -> Result<String> {
+    let status = response.status();
+    let reset = response
+        .headers()
+        .get("x-rate-limit-reset")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
+    let body = response
+        .text()
+        .await
+        .map_err(|e| anyhow!("network error reading X API response: {e}"))?;
+
+    if !status.is_success() {
+        return Err(api_error(status, &body, reset.as_deref()));
+    }
+    Ok(body)
+}
+
+fn tweet_body(text: &str, media_ids: Option<&[String]>) -> serde_json::Value {
+    match media_ids {
+        Some(ids) if !ids.is_empty() => {
+            serde_json::json!({ "text": text, "media": { "media_ids": ids } })
+        }
+        _ => serde_json::json!({ "text": text }),
+    }
+}
+
+fn parse_media_id(body: &str) -> Result<String> {
+    let parsed: MediaUploadResponse = serde_json::from_str(body)
+        .with_context(|| format!("unexpected X media upload response: {body}"))?;
+    Ok(parsed.media_id_string)
+}
+
+fn image_mime_type(path: &Path) -> Option<&'static str> {
+    let ext = path.extension()?.to_str()?.to_ascii_lowercase();
+    match ext.as_str() {
+        "png" => Some("image/png"),
+        "jpg" | "jpeg" => Some("image/jpeg"),
+        "gif" => Some("image/gif"),
+        "webp" => Some("image/webp"),
+        _ => None,
     }
 }
 
@@ -93,9 +179,10 @@ pub async fn post_with_limit(
     client: &XClient,
     limiter: &RateLimiter,
     text: &str,
+    media_ids: Option<&[String]>,
 ) -> Result<(Tweet, State)> {
     limiter.check()?;
-    let tweet = client.post_tweet(text).await?;
+    let tweet = client.post_tweet(text, media_ids).await?;
     let state = limiter
         .record()
         .context("tweet was posted, but updating the daily counter failed")?;
@@ -113,11 +200,18 @@ struct CreatedTweet {
     text: String,
 }
 
-/// X API v2 returns either problem-details (`title`/`detail`) or an `errors` array.
+#[derive(Deserialize)]
+struct MediaUploadResponse {
+    media_id_string: String,
+}
+
+/// X API v2 returns either problem-details (`title`/`detail`) or an `errors` array;
+/// the v1.1 media endpoint may instead return a bare `error` string.
 #[derive(Deserialize, Default)]
 struct ApiErrorBody {
     title: Option<String>,
     detail: Option<String>,
+    error: Option<String>,
     #[serde(default)]
     errors: Vec<ApiErrorItem>,
 }
@@ -135,7 +229,7 @@ fn api_error(status: StatusCode, body: &str, rate_limit_reset: Option<&str>) -> 
         .iter()
         .filter_map(|e| e.message.clone().or_else(|| e.detail.clone()))
         .collect();
-    if let Some(detail) = parsed.detail.or(parsed.title) {
+    if let Some(detail) = parsed.detail.or(parsed.title).or(parsed.error) {
         messages.insert(0, detail);
     }
     let detail = if messages.is_empty() {
@@ -375,5 +469,64 @@ mod tests {
 
         let msg = api_error(StatusCode::TOO_MANY_REQUESTS, "", Some("1700000000")).to_string();
         assert!(msg.contains("Resets at"), "{msg}");
+
+        let body = r#"{"errors":[{"code":324,"message":"Invalid media"}]}"#;
+        let msg = api_error(StatusCode::BAD_REQUEST, body, None).to_string();
+        assert!(msg.contains("Invalid media"), "{msg}");
+
+        let body = r#"{"request":"/1.1/media/upload.json","error":"media type unrecognized."}"#;
+        let msg = api_error(StatusCode::BAD_REQUEST, body, None).to_string();
+        assert!(msg.contains("media type unrecognized"), "{msg}");
+    }
+
+    #[test]
+    fn media_upload_response_parsing() {
+        let body = r#"{
+            "media_id": 710511363345354753,
+            "media_id_string": "710511363345354753",
+            "size": 11065,
+            "expires_after_secs": 86400,
+            "image": {"image_type": "image/png", "w": 800, "h": 320}
+        }"#;
+        assert_eq!(parse_media_id(body).unwrap(), "710511363345354753");
+
+        let err = parse_media_id(r#"{"media_id": 1}"#).unwrap_err().to_string();
+        assert!(err.contains("unexpected X media upload response"), "{err}");
+    }
+
+    #[test]
+    fn tweet_body_includes_media_only_when_present() {
+        assert_eq!(tweet_body("hi", None), serde_json::json!({ "text": "hi" }));
+        assert_eq!(tweet_body("hi", Some(&[])), serde_json::json!({ "text": "hi" }));
+        let ids = vec!["123".to_owned()];
+        assert_eq!(
+            tweet_body("hi", Some(&ids)),
+            serde_json::json!({ "text": "hi", "media": { "media_ids": ["123"] } })
+        );
+    }
+
+    #[test]
+    fn image_mime_type_from_extension() {
+        assert_eq!(image_mime_type(Path::new("a/photo.PNG")), Some("image/png"));
+        assert_eq!(image_mime_type(Path::new("x.jpeg")), Some("image/jpeg"));
+        assert_eq!(image_mime_type(Path::new("noext")), None);
+    }
+
+    #[tokio::test]
+    async fn upload_media_missing_file_is_clear_error() {
+        let config = Config {
+            api_key: "ck".into(),
+            api_secret: "cs".into(),
+            access_token: "tk".into(),
+            access_token_secret: "ts".into(),
+            daily_limit: 50,
+        };
+        let client = XClient::new(config).unwrap();
+        let err = client
+            .upload_media("/nonexistent/kestrel-test.png")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("image file not found"), "{err}");
     }
 }

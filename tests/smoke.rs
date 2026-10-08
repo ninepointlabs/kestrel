@@ -87,6 +87,28 @@ fn configure_status_and_limit_refusal() {
 }
 
 #[test]
+fn post_with_missing_image_fails_before_network() {
+    let home = temp_home("noimage");
+    configure(&home, 5);
+
+    let out = kestrel(
+        &home,
+        &["post", "hello", "--image", "/nonexistent/kestrel-smoke.png"],
+        "",
+    );
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("image file not found"), "{err}");
+
+    let out = kestrel(&home, &["status"], "");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        "Posts today: 0/5 (0%)"
+    );
+    let _ = std::fs::remove_dir_all(home);
+}
+
+#[test]
 fn mcp_server_lists_tools_and_enforces_limit() {
     let home = temp_home("mcp");
     configure(&home, 0);

@@ -15,10 +15,16 @@ pub struct Cli {
 #[derive(Debug, Subcommand)]
 pub enum Command {
     /// Post a tweet
-    #[command(after_help = "Example:\n  kestrel post \"Hello world\"")]
+    #[command(
+        after_help = "Examples:\n  kestrel post \"Hello world\"\n  kestrel post \"check this out\" --image ./photo.png"
+    )]
     Post {
         /// Text of the tweet
         text: String,
+
+        /// Path to an image to attach (PNG, JPEG, GIF, or WebP)
+        #[arg(short, long, value_name = "PATH")]
+        image: Option<String>,
     },
 
     /// Show today's post count against the daily limit

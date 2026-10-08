@@ -33,11 +33,20 @@ async fn main() {
 
 async fn run(cli: Cli) -> Result<()> {
     match cli.command {
-        Command::Post { text } => {
+        Command::Post { text, image } => {
             let config = Config::load()?;
             let limiter = RateLimiter::new(config.daily_limit)?;
             let client = XClient::new(config)?;
-            let (tweet, state) = client::post_with_limit(&client, &limiter, &text).await?;
+            let media_ids = match image {
+                Some(path) => {
+                    // Don't spend an upload on a post the daily limit would refuse.
+                    limiter.check()?;
+                    vec![client.upload_media(&path).await?]
+                }
+                None => Vec::new(),
+            };
+            let (tweet, state) =
+                client::post_with_limit(&client, &limiter, &text, Some(&media_ids)).await?;
             println!("Posted: {}", tweet.url());
             println!("{state}");
         }

@@ -21,6 +21,9 @@ use crate::rate_limiter::RateLimiter;
 pub struct PostArgs {
     /// The text of the tweet to post.
     pub text: String,
+    /// Optional local path to an image (PNG, JPEG, GIF, or WebP) to attach.
+    #[serde(default)]
+    pub image_path: Option<String>,
 }
 
 #[derive(Clone)]
@@ -31,19 +34,36 @@ pub struct KestrelServer {
     post_lock: Arc<Mutex<()>>,
 }
 
+impl KestrelServer {
+    /// Upload the optional image, then post under the daily limit.
+    /// Caller must hold `post_lock`.
+    async fn post(&self, args: &PostArgs) -> Result<(client::Tweet, crate::rate_limiter::State)> {
+        let media_ids = match &args.image_path {
+            Some(path) => {
+                // Don't spend an upload on a post the daily limit would refuse.
+                self.limiter.check()?;
+                vec![self.client.upload_media(path).await?]
+            }
+            None => Vec::new(),
+        };
+        client::post_with_limit(&self.client, &self.limiter, &args.text, Some(&media_ids)).await
+    }
+}
+
 #[tool_router]
 impl KestrelServer {
     #[tool(
         name = "kestrel_post",
-        description = "Post a tweet to X. Subject to a hard daily post limit; \
-                       call kestrel_status to see remaining posts."
+        description = "Post a tweet to X, optionally with an image (image_path: local file \
+                       path). Subject to a hard daily post limit; call kestrel_status to \
+                       see remaining posts."
     )]
     async fn kestrel_post(
         &self,
         Parameters(args): Parameters<PostArgs>,
     ) -> Result<CallToolResult, McpError> {
         let _guard = self.post_lock.lock().await;
-        match client::post_with_limit(&self.client, &self.limiter, &args.text).await {
+        match self.post(&args).await {
             Ok((tweet, state)) => {
                 tracing::info!(id = %tweet.id, "posted tweet");
                 Ok(CallToolResult::success(vec![ContentBlock::text(format!(

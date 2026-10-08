@@ -51,11 +51,16 @@ daily_limit = 50
 
 ```sh
 kestrel post "Hello world"   # Post a tweet, prints its URL and today's usage
+kestrel post "check this out" --image ./photo.png   # Post with an image (-i for short)
 kestrel status               # Posts today: 3/50 (6%)
 kestrel configure            # Interactive credential setup
 kestrel serve                # MCP server on stdio
 kestrel --help
 ```
+
+Images (PNG, JPEG, GIF, WebP) are uploaded to X's media endpoint first, then attached
+to the tweet. Only the posted tweet counts toward Kestrel's daily limit, and no upload
+is attempted once the limit is reached.
 
 Set `KESTREL_LOG=info` (or `debug`) for logs on stderr.
 
@@ -80,7 +85,7 @@ and exposes two tools:
 
 | Tool             | Arguments         | Description                                    |
 |------------------|-------------------|------------------------------------------------|
-| `kestrel_post`   | `text` (string)   | Post to X. Returns an error result at the limit. |
+| `kestrel_post`   | `text` (string), `image_path` (string, optional) | Post to X, optionally attaching a local image. Returns an error result at the limit. |
 | `kestrel_status` | none              | Today's count, limit, and remaining posts.     |
 
 Example client configuration (Claude Desktop / Claude Code / Hermes style):
