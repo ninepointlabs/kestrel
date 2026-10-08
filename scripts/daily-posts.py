@@ -115,7 +115,10 @@ def _rss_items(feed_url: str) -> list[dict[str, str]]:
     return items
 
 
-def _fit(text: str, budget: int) -> str:
+TWEET_BUDGET = 4000  # X Premium: 25,000; we stay well under that
+
+def _fit(text: str, budget: int = TWEET_BUDGET) -> str:
+    """Truncate only when truly needed. X Premium gives us 25K chars to work with."""
     if len(text) <= budget:
         return text
     return text[: budget - 3].rstrip() + "..."
@@ -150,7 +153,7 @@ def _blog_tweet(blog_name: str, title: str, link: str, desc: str) -> str:
     else:
         tweet = f"{hook}\n\n{closer}"
 
-    return _fit(tweet, 275)
+    return _fit(tweet)
 
 
 _REPO_INTROS = [
@@ -182,7 +185,7 @@ def _repo_tweet(name: str, desc: str, url: str) -> str:
     closer = closer_t.format(url)
 
     tweet = f"{intro}\n\n{closer}"
-    return _fit(tweet, 275)
+    return _fit(tweet)
 
 
 _DAILY_INTROS = [
@@ -233,7 +236,7 @@ def _daily_tweet(commits: list[tuple[str, str]], note: str | None) -> str | None
         ]
         tweet += random.choice(tags)
 
-    return _fit(tweet, 275)
+    return _fit(tweet)
 
 
 # ── post-type handlers ───────────────────────────────────────────────────────
