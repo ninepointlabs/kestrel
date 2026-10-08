@@ -1,1 +1,5 @@
 /target
+/pkg
+/kestrel_*.deb
+/kestrel-*.rpm
+/kestrel-*.pkg.tar.zst
