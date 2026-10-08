@@ -24,6 +24,9 @@ pub struct PostArgs {
     /// Optional local path to an image (PNG, JPEG, GIF, or WebP) to attach.
     #[serde(default)]
     pub image_path: Option<String>,
+    /// Optional tweet ID to reply to (e.g. to put a link in a reply under a plain tweet).
+    #[serde(default)]
+    pub reply_to_id: Option<String>,
 }
 
 #[derive(Clone)]
@@ -46,7 +49,14 @@ impl KestrelServer {
             }
             None => Vec::new(),
         };
-        client::post_with_limit(&self.client, &self.limiter, &args.text, Some(&media_ids)).await
+        client::post_with_limit(
+            &self.client,
+            &self.limiter,
+            &args.text,
+            Some(&media_ids),
+            args.reply_to_id.as_deref(),
+        )
+        .await
     }
 }
 
@@ -55,7 +65,7 @@ impl KestrelServer {
     #[tool(
         name = "kestrel_post",
         description = "Post a tweet to X, optionally with an image (image_path: local file \
-                       path). Subject to a hard daily post limit; call kestrel_status to \
+                       path) and/or as a reply to another tweet (reply_to_id). Subject to a hard daily post limit; call kestrel_status to \
                        see remaining posts."
     )]
     async fn kestrel_post(

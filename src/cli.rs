@@ -16,7 +16,7 @@ pub struct Cli {
 pub enum Command {
     /// Post a tweet
     #[command(
-        after_help = "Examples:\n  kestrel post \"Hello world\"\n  kestrel post \"check this out\" --image ./photo.png"
+        after_help = "Examples:\n  kestrel post \"Hello world\"\n  kestrel post \"check this out\" --image ./photo.png\n  kestrel post \"https://example.com\" --reply-to 1846987139428634858"
     )]
     Post {
         /// Text of the tweet
@@ -25,6 +25,10 @@ pub enum Command {
         /// Path to an image to attach (PNG, JPEG, GIF, or WebP)
         #[arg(short, long, value_name = "PATH")]
         image: Option<String>,
+
+        /// Post as a reply to this tweet ID (e.g. a link reply under a plain tweet)
+        #[arg(long, value_name = "TWEET_ID")]
+        reply_to: Option<String>,
     },
 
     /// Show today's post count against the daily limit

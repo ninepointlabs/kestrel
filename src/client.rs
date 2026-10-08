@@ -44,10 +44,19 @@ impl XClient {
         Ok(Self { http, config })
     }
 
-    /// Post a tweet, optionally attaching media previously returned by [`Self::upload_media`].
-    pub async fn post_tweet(&self, text: &str, media_ids: Option<&[String]>) -> Result<Tweet> {
+    /// Post a tweet, optionally attaching media previously returned by [`Self::upload_media`]
+    /// and optionally as a reply to the tweet `reply_to_id`.
+    pub async fn post_tweet(
+        &self,
+        text: &str,
+        media_ids: Option<&[String]>,
+        reply_to_id: Option<&str>,
+    ) -> Result<Tweet> {
         if text.trim().is_empty() {
             bail!("tweet text is empty");
+        }
+        if let Some(id) = reply_to_id {
+            validate_tweet_id(id)?;
         }
 
         let auth = authorization_header(
@@ -62,7 +71,7 @@ impl XClient {
             .http
             .post(TWEETS_URL)
             .header(header::AUTHORIZATION, auth)
-            .json(&tweet_body(text, media_ids))
+            .json(&tweet_body(text, media_ids, reply_to_id))
             .send()
             .await
             .map_err(|e| anyhow!("network error contacting X API: {e}"))?;
@@ -74,6 +83,17 @@ impl XClient {
             id: parsed.data.id,
             text: parsed.data.text,
         })
+    }
+
+    /// Post `text` as a reply to the tweet `reply_to_id` (e.g. a "summoned reply"
+    /// carrying the link for a plain parent tweet).
+    pub async fn post_reply(
+        &self,
+        text: &str,
+        reply_to_id: &str,
+        media_ids: Option<&[String]>,
+    ) -> Result<Tweet> {
+        self.post_tweet(text, media_ids, Some(reply_to_id)).await
     }
 
     /// Upload an image file and return its `media_id_string` for use in [`Self::post_tweet`].
@@ -121,9 +141,7 @@ impl XClient {
             .send()
             .await
             .map_err(|e| anyhow!("network error uploading media to X: {e}"))?;
-        let body = read_body(response)
-            .await
-            .context("media upload failed")?;
+        let body = read_body(response).await.context("media upload failed")?;
         parse_media_id(&body)
     }
 }
@@ -147,13 +165,29 @@ async fn read_body(response: reqwest::Response) -> Result<String> {
     Ok(body)
 }
 
-fn tweet_body(text: &str, media_ids: Option<&[String]>) -> serde_json::Value {
-    match media_ids {
-        Some(ids) if !ids.is_empty() => {
-            serde_json::json!({ "text": text, "media": { "media_ids": ids } })
-        }
-        _ => serde_json::json!({ "text": text }),
+fn tweet_body(
+    text: &str,
+    media_ids: Option<&[String]>,
+    reply_to_id: Option<&str>,
+) -> serde_json::Value {
+    let mut body = serde_json::json!({ "text": text });
+    if let Some(ids) = media_ids.filter(|ids| !ids.is_empty()) {
+        body["media"] = serde_json::json!({ "media_ids": ids });
     }
+    if let Some(id) = reply_to_id {
+        body["reply"] = serde_json::json!({ "in_reply_to_tweet_id": id });
+    }
+    body
+}
+
+/// Tweet IDs are numeric strings; catch typos (or pasted URLs) before calling the API.
+fn validate_tweet_id(id: &str) -> Result<()> {
+    if id.is_empty() || !id.bytes().all(|b| b.is_ascii_digit()) {
+        bail!(
+            "invalid tweet ID to reply to: {id:?} (expected digits only, e.g. 1846987139428634858)"
+        );
+    }
+    Ok(())
 }
 
 fn parse_media_id(body: &str) -> Result<String> {
@@ -180,9 +214,13 @@ pub async fn post_with_limit(
     limiter: &RateLimiter,
     text: &str,
     media_ids: Option<&[String]>,
+    reply_to_id: Option<&str>,
 ) -> Result<(Tweet, State)> {
     limiter.check()?;
-    let tweet = client.post_tweet(text, media_ids).await?;
+    let tweet = match reply_to_id {
+        Some(id) => client.post_reply(text, id, media_ids).await?,
+        None => client.post_tweet(text, media_ids, None).await?,
+    };
     let state = limiter
         .record()
         .context("tweet was posted, but updating the daily counter failed")?;
@@ -490,19 +528,55 @@ mod tests {
         }"#;
         assert_eq!(parse_media_id(body).unwrap(), "710511363345354753");
 
-        let err = parse_media_id(r#"{"media_id": 1}"#).unwrap_err().to_string();
+        let err = parse_media_id(r#"{"media_id": 1}"#)
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("unexpected X media upload response"), "{err}");
     }
 
     #[test]
     fn tweet_body_includes_media_only_when_present() {
-        assert_eq!(tweet_body("hi", None), serde_json::json!({ "text": "hi" }));
-        assert_eq!(tweet_body("hi", Some(&[])), serde_json::json!({ "text": "hi" }));
+        assert_eq!(
+            tweet_body("hi", None, None),
+            serde_json::json!({ "text": "hi" })
+        );
+        assert_eq!(
+            tweet_body("hi", Some(&[]), None),
+            serde_json::json!({ "text": "hi" })
+        );
         let ids = vec!["123".to_owned()];
         assert_eq!(
-            tweet_body("hi", Some(&ids)),
+            tweet_body("hi", Some(&ids), None),
             serde_json::json!({ "text": "hi", "media": { "media_ids": ["123"] } })
         );
+    }
+
+    #[test]
+    fn tweet_body_includes_reply_when_present() {
+        assert_eq!(
+            tweet_body("link", None, Some("1846987139428634858")),
+            serde_json::json!({
+                "text": "link",
+                "reply": { "in_reply_to_tweet_id": "1846987139428634858" }
+            })
+        );
+        let ids = vec!["123".to_owned()];
+        assert_eq!(
+            tweet_body("hi", Some(&ids), Some("42")),
+            serde_json::json!({
+                "text": "hi",
+                "media": { "media_ids": ["123"] },
+                "reply": { "in_reply_to_tweet_id": "42" }
+            })
+        );
+    }
+
+    #[test]
+    fn tweet_id_validation() {
+        assert!(validate_tweet_id("1846987139428634858").is_ok());
+        assert!(validate_tweet_id("").is_err());
+        assert!(validate_tweet_id("https://x.com/i/status/123").is_err());
+        assert!(validate_tweet_id("12a").is_err());
     }
 
     #[test]

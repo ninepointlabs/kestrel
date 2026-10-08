@@ -4,8 +4,11 @@ Kestrel Daily Posts — schedule and post 3 tweets/day at random times,
 written in Tim's voice (warm, funny, no corporate-speak).
 
 Three post types, randomly assigned to time slots spread across the day:
-  blog  — a random recent post from one of Tim's 3 blogs (includes link)
-  repo  — a random public non-archived ninepointlabs GitHub repo (includes link)
+  blog  — a random recent post from one of Tim's 3 blogs (link in a reply)
+  repo  — a random public non-archived ninepointlabs GitHub repo (link in a reply)
+
+Links go in a summoned reply under a plain tweet rather than in the tweet
+itself: plain post + reply is far cheaper on the X API than one post with a URL.
   daily — today's git commits or Obsidian daily note (no link, no URL tax)
 
 Run with no args to schedule today's posts via `at`.  Cron entry:
@@ -80,10 +83,14 @@ def send_telegram(text: str) -> bool:
         return False
 
 
-def post_tweet(text: str, image: str | None = None) -> tuple[bool, str]:
+def post_tweet(
+    text: str, image: str | None = None, reply_to: str | None = None,
+) -> tuple[bool, str]:
     cmd = [KESTREL_BIN, "post", text]
     if image:
         cmd.extend(["--image", image])
+    if reply_to:
+        cmd.extend(["--reply-to", reply_to])
     result = subprocess.run(
         cmd, capture_output=True, text=True, timeout=60,
         env={**os.environ, "KESTREL_LOG": "warn"},
@@ -91,6 +98,51 @@ def post_tweet(text: str, image: str | None = None) -> tuple[bool, str]:
     if result.returncode == 0:
         return True, result.stdout.strip()
     return False, result.stderr.strip() or "(no output)"
+
+
+def _tweet_id(kestrel_output: str) -> str | None:
+    """Pull the tweet ID out of kestrel's `Posted: https://x.com/i/status/<id>` line."""
+    m = re.search(r"/status/(\d+)", kestrel_output)
+    return m.group(1) if m else None
+
+
+def post_with_link_reply(main: str, reply: str, dry_run: bool = False) -> str:
+    """Post `main` as a plain tweet, then `reply` (carrying the link) as a reply to it.
+
+    Cheaper than one tweet with a URL in it: plain post + summoned reply.
+    """
+    print(f"  Tweet ({len(main)} chars): {main[:100]}...")
+    print(f"  Reply ({len(reply)} chars): {reply[:100]}")
+    if dry_run:
+        print("  [DRY RUN] would post:")
+        print(textwrap.indent(main, "    1│ "))
+        print(textwrap.indent(reply, "    2│ "))
+        return main
+
+    ok, out = post_tweet(main)
+    if not ok:
+        print(f"  ✗  {out}")
+        send_telegram(f"🐦 Post FAILED:\n\n{out}")
+        return main
+    print(f"  ✓  {out}")
+
+    parent_id = _tweet_id(out)
+    if parent_id is None:
+        msg = f"posted main tweet but couldn't parse its ID from kestrel output: {out}"
+        print(f"  ✗  {msg}")
+        send_telegram(f"🐦 Posted to X (link reply SKIPPED — {msg}):\n\n{main}")
+        return main
+
+    ok, rout = post_tweet(reply, reply_to=parent_id)
+    if ok:
+        print(f"  ✓  reply: {rout}")
+        send_telegram(f"🐦 Posted to X:\n\n{main}\n\n↳ {reply}")
+    else:
+        print(f"  ✗  reply: {rout}")
+        send_telegram(
+            f"🐦 Posted to X, but link reply FAILED:\n\n{main}\n\n{out}\n\nReply error: {rout}"
+        )
+    return main
 
 
 def _rss_items(feed_url: str) -> list[dict[str, str]]:
@@ -126,8 +178,11 @@ def _fit(text: str, budget: int = TWEET_BUDGET) -> str:
 
 # ── voice: tweet crafters ────────────────────────────────────────────────────
 
-def _blog_tweet(blog_name: str, title: str, link: str, desc: str) -> str:
-    """Craft a blog-promo tweet in Tim's casual, warm voice."""
+def _blog_tweet(blog_name: str, title: str, link: str, desc: str) -> tuple[str, str]:
+    """Craft a blog-promo tweet in Tim's casual, warm voice.
+
+    Returns (main, reply): the main tweet has no link; the reply carries it.
+    """
 
     desc = re.sub(r"^[A-Z][a-z]{2} \d{1,2}, \d{4}\s*[—–-]\s*", "", desc)
 
@@ -139,21 +194,21 @@ def _blog_tweet(blog_name: str, title: str, link: str, desc: str) -> str:
         f"I put some words together about {title.split(':')[0].strip().lower()}",
     ]
     closers = [
-        link,
-        f"{link} — come hang out",
-        f"Read it here: {link}",
-        f"{link} — tell me I'm wrong",
+        f"from {blog_name}",
+        f"from {blog_name} — come hang out",
+        f"from {blog_name} — tell me I'm wrong",
+        f"Read it here, from {blog_name}",
     ]
 
     hook = random.choice(hooks)
     closer = random.choice(closers)
 
     if desc and len(desc) > 30:
-        tweet = f"{hook}\n\n{desc}\n\n{closer}"
+        main = f"{hook}\n\n{desc}"
     else:
-        tweet = f"{hook}\n\n{closer}"
+        main = hook
 
-    return _fit(tweet)
+    return _fit(main), f"{link}\n\n{closer}"
 
 
 _REPO_INTROS = [
@@ -175,7 +230,8 @@ _REPO_CLOSERS = [
 ]
 
 
-def _repo_tweet(name: str, desc: str, url: str) -> str:
+def _repo_tweet(name: str, desc: str, url: str) -> tuple[str, str]:
+    """Returns (main, reply): the main tweet has no link; the reply carries it."""
     if not desc:
         desc = "it does a thing and it does it pretty well"
 
@@ -184,8 +240,7 @@ def _repo_tweet(name: str, desc: str, url: str) -> str:
     intro = intro_t.format(name, desc)
     closer = closer_t.format(url)
 
-    tweet = f"{intro}\n\n{closer}"
-    return _fit(tweet)
+    return _fit(intro), closer
 
 
 _DAILY_INTROS = [
@@ -259,21 +314,8 @@ def do_blog(dry_run: bool = False) -> str | None:
 
     pool = items[: min(30, len(items))]
     post = random.choice(pool)
-    tweet = _blog_tweet(blog_name, post["title"], post["link"], post.get("desc", ""))
-
-    print(f"  Tweet ({len(tweet)} chars): {tweet[:100]}...")
-    if dry_run:
-        print("  [DRY RUN]")
-        return tweet
-
-    ok, out = post_tweet(tweet)
-    if ok:
-        print(f"  ✓  {out}")
-        send_telegram(f"🐦 Posted to X:\n\n{tweet}")
-    else:
-        print(f"  ✗  {out}")
-        send_telegram(f"🐦 Post FAILED:\n\n{out}")
-    return tweet
+    main, reply = _blog_tweet(blog_name, post["title"], post["link"], post.get("desc", ""))
+    return post_with_link_reply(main, reply, dry_run=dry_run)
 
 
 def do_repo(dry_run: bool = False) -> str | None:
@@ -299,22 +341,10 @@ def do_repo(dry_run: bool = False) -> str | None:
     desc = repo.get("description") or ""
     url = f"https://github.com/ninepointlabs/{name}"
 
-    tweet = _repo_tweet(name, desc, url)
+    main, reply = _repo_tweet(name, desc, url)
 
     print(f"  Repo: {name}")
-    print(f"  Tweet ({len(tweet)} chars): {tweet[:100]}...")
-    if dry_run:
-        print("  [DRY RUN]")
-        return tweet
-
-    ok, out = post_tweet(tweet)
-    if ok:
-        print(f"  ✓  {out}")
-        send_telegram(f"🐦 Posted to X:\n\n{tweet}")
-    else:
-        print(f"  ✗  {out}")
-        send_telegram(f"🐦 Post FAILED:\n\n{out}")
-    return tweet
+    return post_with_link_reply(main, reply, dry_run=dry_run)
 
 
 def _todays_git_commits() -> list[tuple[str, str]]:
