@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """
-Kestrel Daily Posts — schedule and post 3 tweets/day at random times.
+Kestrel Daily Posts — schedule and post 3 tweets/day at random times,
+written in Tim's voice (warm, funny, no corporate-speak).
 
-Three post types, randomly assigned time slots spread across the day:
+Three post types, randomly assigned to time slots spread across the day:
   blog  — a random recent post from one of Tim's 3 blogs (includes link)
   repo  — a random public non-archived ninepointlabs GitHub repo (includes link)
-  daily — today's git commits or Obsidian daily note (no link)
+  daily — today's git commits or Obsidian daily note (no link, no URL tax)
 
-Run with no args to schedule today's posts via `at`.  Add a daily cron entry:
+Run with no args to schedule today's posts via `at`.  Cron entry:
   0 7 * * * cd ~/Projects/kestrel && python3 scripts/daily-posts.py
 """
 
@@ -17,6 +18,7 @@ import argparse
 import json
 import os
 import random
+import re
 import subprocess
 import sys
 import textwrap
@@ -25,7 +27,7 @@ import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta
-from pathlib import Path
+from html import unescape as html_unescape
 
 HERMES_HOME = os.environ.get("HERMES_HOME", os.path.expanduser("~/.hermes"))
 KESTREL_BIN = os.path.expanduser("~/.cargo/bin/kestrel")
@@ -38,11 +40,9 @@ BLOG_FEEDS = [
     ("Tim Apple's Desk", "https://timapple.com/feed.xml"),
 ]
 
-
 # ── helpers ──────────────────────────────────────────────────────────────────
 
 def _load_env() -> dict[str, str]:
-    """Read HERMES_HOME/.env for TELEGRAM_BOT_TOKEN / TELEGRAM_HOME_CHANNEL."""
     env: dict[str, str] = {}
     env_path = os.path.join(HERMES_HOME, ".env")
     try:
@@ -62,16 +62,15 @@ def _telegram_api(token: str, method: str, **params) -> dict:
     if params:
         url += "?" + urllib.parse.urlencode(params)
     with urllib.request.urlopen(url, timeout=15) as resp:
-        return json.loads(resp.read())  # type: ignore[no-any-return]
+        return json.loads(resp.read())
 
 
 def send_telegram(text: str) -> bool:
-    """Deliver a message to Tim's home channel.  Returns True on success."""
     env = _load_env()
     token = env.get("TELEGRAM_BOT_TOKEN", "")
     chat_id = env.get("TELEGRAM_HOME_CHANNEL", "")
     if not token or not chat_id:
-        print("  ⚠  Telegram not configured — skipping notification", file=sys.stderr)
+        print("  ⚠  Telegram not configured", file=sys.stderr)
         return False
     try:
         _telegram_api(token, "sendMessage", chat_id=chat_id, text=text)
@@ -82,7 +81,6 @@ def send_telegram(text: str) -> bool:
 
 
 def post_tweet(text: str, image: str | None = None) -> tuple[bool, str]:
-    """Post via kestrel CLI.  Returns (success, stdout_or_stderr)."""
     cmd = [KESTREL_BIN, "post", text]
     if image:
         cmd.extend(["--image", image])
@@ -95,77 +93,190 @@ def post_tweet(text: str, image: str | None = None) -> tuple[bool, str]:
     return False, result.stderr.strip() or "(no output)"
 
 
-def _rss_items(feed_url: str) -> list[tuple[str, str]]:
-    """Return [(title, link), ...] from an RSS feed."""
-    items: list[tuple[str, str]] = []
+def _rss_items(feed_url: str) -> list[dict[str, str]]:
+    """Return [{'title':..., 'link':..., 'desc':...}, ...] from an RSS feed."""
+    items: list[dict[str, str]] = []
     with urllib.request.urlopen(feed_url, timeout=20) as resp:
         body = resp.read()
-    # folderblog RSS may have a default namespace; handle both ns and no-ns
     root = ET.fromstring(body)
-    ns = "http://purl.org/rss/1.0/modules/content/"
     for item in root.findall(".//item"):
-        title_el = item.find("title")
-        link_el = item.find("link")
-        title = (title_el.text or "").strip() if title_el is not None else ""
-        link = (link_el.text or "").strip() if link_el is not None else ""
+        title = (item.findtext("title") or "").strip()
+        link = (item.findtext("link") or "").strip()
+        desc_el = item.find("description")
+        desc = ""
+        if desc_el is not None and desc_el.text:
+            desc = html_unescape(desc_el.text.strip())
+            desc = re.sub(r"<[^>]+>", "", desc)
+            desc = desc.strip()
+            if len(desc) > 200:
+                desc = desc[:197] + "..."
         if title and link:
-            items.append((title, link))
+            items.append({"title": title, "link": link, "desc": desc})
     return items
+
+
+def _fit(text: str, budget: int) -> str:
+    if len(text) <= budget:
+        return text
+    return text[: budget - 3].rstrip() + "..."
+
+
+# ── voice: tweet crafters ────────────────────────────────────────────────────
+
+def _blog_tweet(blog_name: str, title: str, link: str, desc: str) -> str:
+    """Craft a blog-promo tweet in Tim's casual, warm voice."""
+
+    desc = re.sub(r"^[A-Z][a-z]{2} \d{1,2}, \d{4}\s*[—–-]\s*", "", desc)
+
+    hooks = [
+        f"New on the {blog_name} blog: {title}",
+        f"Wrote a thing: {title}",
+        f"Just posted: {title}",
+        f"Fresh off the keyboard — {title}",
+        f"I put some words together about {title.split(':')[0].strip().lower()}",
+    ]
+    closers = [
+        link,
+        f"{link} — come hang out",
+        f"Read it here: {link}",
+        f"{link} — tell me I'm wrong",
+    ]
+
+    hook = random.choice(hooks)
+    closer = random.choice(closers)
+
+    if desc and len(desc) > 30:
+        tweet = f"{hook}\n\n{desc}\n\n{closer}"
+    else:
+        tweet = f"{hook}\n\n{closer}"
+
+    return _fit(tweet, 275)
+
+
+_REPO_INTROS = [
+    "Built {} — {}",
+    "{}: {}",
+    "Made a thing called {}. {}",
+    "I shipped {} because {}",
+    "{} exists now. {}",
+    "Remember {}? {}",
+    "{} — {}",
+]
+
+_REPO_CLOSERS = [
+    "{}",
+    "{} — code's public, go look",
+    "GitHub: {}",
+    "{} — pull requests welcome, or don't, I'm not your mom",
+    "{} — it's probably got bugs but it's my bugs",
+]
+
+
+def _repo_tweet(name: str, desc: str, url: str) -> str:
+    if not desc:
+        desc = "it does a thing and it does it pretty well"
+
+    intro_t = random.choice(_REPO_INTROS)
+    closer_t = random.choice(_REPO_CLOSERS)
+    intro = intro_t.format(name, desc)
+    closer = closer_t.format(url)
+
+    tweet = f"{intro}\n\n{closer}"
+    return _fit(tweet, 275)
+
+
+_DAILY_INTROS = [
+    "Today in Tim-land:",
+    "What I actually did today:",
+    "Today's damage report:",
+    "The git log says I",
+    "So today I",
+    "Monday? No idea. But today I",
+    "Another day, another",
+    "What got shipped today:",
+]
+
+
+def _daily_tweet(commits: list[tuple[str, str]], note: str | None) -> str | None:
+    if not commits and not note:
+        return None
+
+    parts: list[str] = []
+
+    if commits:
+        proj_counts: dict[str, int] = {}
+        for proj, _ in commits:
+            base = proj.replace("-", " ").replace("_", " ")
+            proj_counts[base] = proj_counts.get(base, 0) + 1
+        top = sorted(proj_counts.items(), key=lambda x: -x[1])[:3]
+        proj_bits = []
+        for p, c in top:
+            s = "s" if c > 1 else ""
+            proj_bits.append(f"{c} commit{s} in {p}")
+        proj_str = " · ".join(proj_bits)
+        parts.append(f"pushed {proj_str}")
+
+    if note:
+        parts.append(note)
+
+    intro = random.choice(_DAILY_INTROS)
+    body = " · ".join(parts)
+
+    tweet = f"{intro} {body}"
+
+    if random.random() < 0.4:
+        tags = [
+            "\n\n✌️",
+            "\n\nThat's the update. Back to it.",
+            "\n\nProbably should've napped instead.",
+            "\n\nShipping > sleeping, apparently.",
+        ]
+        tweet += random.choice(tags)
+
+    return _fit(tweet, 275)
 
 
 # ── post-type handlers ───────────────────────────────────────────────────────
 
 def do_blog(dry_run: bool = False) -> str | None:
-    """Pick a random post from a random blog, post with link.  Returns tweet text or None."""
     blog_name, feed_url = random.choice(BLOG_FEEDS)
     print(f"  Blog: {blog_name}")
 
     try:
         items = _rss_items(feed_url)
     except Exception as exc:
-        msg = f"Failed to fetch {feed_url}: {exc}"
+        msg = f"RSS fetch failed for {feed_url}: {exc}"
         print(f"  ✗  {msg}")
         send_telegram(f"🐦 Blog post FAILED: {msg}")
         return None
 
     if not items:
-        msg = f"No posts found in {blog_name}"
-        print(f"  ✗  {msg}")
+        print(f"  ✗  No posts in {blog_name}")
         return None
 
-    # pick from the 30 most recent so we don't dig up ancient posts
     pool = items[: min(30, len(items))]
-    title, link = random.choice(pool)
+    post = random.choice(pool)
+    tweet = _blog_tweet(blog_name, post["title"], post["link"], post.get("desc", ""))
 
-    # craft tweet — keep title + link under 280 chars
-    tweet = f"{title}\n\n{link}"
-    if len(tweet) > 270:
-        # truncate title, keep link
-        max_title = 270 - len(link) - 4  # 4 for "\n\n" and "..."
-        tweet = f"{title[:max_title]}...\n\n{link}"
-
-    print(f"  Tweet: {tweet[:80]}...")
+    print(f"  Tweet ({len(tweet)} chars): {tweet[:100]}...")
     if dry_run:
-        print(f"  [DRY RUN]")
+        print("  [DRY RUN]")
         return tweet
 
     ok, out = post_tweet(tweet)
     if ok:
         print(f"  ✓  {out}")
-        send_telegram(f"🐦 Blog post from {blog_name}:\n\n{tweet}\n\n{out}")
+        send_telegram(f"🐦 Posted to X:\n\n{tweet}")
     else:
         print(f"  ✗  {out}")
-        send_telegram(f"🐦 Blog post FAILED:\n\n{out}")
+        send_telegram(f"🐦 Post FAILED:\n\n{out}")
     return tweet
 
 
 def do_repo(dry_run: bool = False) -> str | None:
-    """Pick a random public non-archived ninepointlabs repo, post with link."""
     result = subprocess.run(
-        [
-            "gh", "repo", "list", "ninepointlabs",
-            "--limit", "50", "--json", "name,description,isPrivate,isArchived",
-        ],
+        ["gh", "repo", "list", "ninepointlabs", "--limit", "50",
+         "--json", "name,description,isPrivate,isArchived"],
         capture_output=True, text=True, timeout=15,
     )
     if result.returncode != 0:
@@ -175,43 +286,35 @@ def do_repo(dry_run: bool = False) -> str | None:
         return None
 
     repos = json.loads(result.stdout)
-    public = [
-        r for r in repos
-        if not r.get("isPrivate") and not r.get("isArchived")
-    ]
+    public = [r for r in repos if not r.get("isPrivate") and not r.get("isArchived")]
     if not public:
         print("  ✗  No public repos found")
         return None
 
     repo = random.choice(public)
     name = repo["name"]
-    desc = repo.get("description") or "Check it out"
+    desc = repo.get("description") or ""
     url = f"https://github.com/ninepointlabs/{name}"
 
-    # craft tweet — url is ~50 chars, leaving ~220 for description
-    tweet = f"{desc}\n\n{url}"
-    if len(tweet) > 270:
-        max_desc = 270 - len(url) - 4
-        tweet = f"{desc[:max_desc]}...\n\n{url}"
+    tweet = _repo_tweet(name, desc, url)
 
     print(f"  Repo: {name}")
-    print(f"  Tweet: {tweet[:80]}...")
+    print(f"  Tweet ({len(tweet)} chars): {tweet[:100]}...")
     if dry_run:
-        print(f"  [DRY RUN]")
+        print("  [DRY RUN]")
         return tweet
 
     ok, out = post_tweet(tweet)
     if ok:
         print(f"  ✓  {out}")
-        send_telegram(f"🐦 Repo highlight:\n\n{tweet}\n\n{out}")
+        send_telegram(f"🐦 Posted to X:\n\n{tweet}")
     else:
         print(f"  ✗  {out}")
-        send_telegram(f"🐦 Repo post FAILED:\n\n{out}")
+        send_telegram(f"🐦 Post FAILED:\n\n{out}")
     return tweet
 
 
 def _todays_git_commits() -> list[tuple[str, str]]:
-    """Return [(project, oneline), ...] for today's commits by Tim."""
     today = datetime.now().strftime("%Y-%m-%d")
     projects_dir = os.path.expanduser("~/Projects")
     commits: list[tuple[str, str]] = []
@@ -234,81 +337,54 @@ def _todays_git_commits() -> list[tuple[str, str]]:
 
 
 def _todays_obsidian_snippet() -> str | None:
-    """Return first paragraph of today's daily note, or None."""
     today = datetime.now().strftime("%Y-%m-%d")
     note_path = os.path.expanduser(f"~/Documents/Notes/daily/{today}.md")
     if not os.path.exists(note_path):
         return None
     try:
         with open(note_path, encoding="utf-8") as fh:
-            text = fh.read(600)
+            text = fh.read(800)
     except Exception:
         return None
-    # grab first non-empty, non-heading line(s)
     for line in text.split("\n"):
-        stripped = line.strip().lstrip("#").strip()
-        if stripped and not stripped.startswith("---"):
-            if len(stripped) > 120:
-                stripped = stripped[:117] + "..."
-            return stripped
+        stripped = line.strip().lstrip("#- ").strip()
+        if stripped and len(stripped) > 10:
+            return _fit(stripped, 140)
     return None
 
 
 def do_daily(dry_run: bool = False) -> str | None:
-    """Craft a no-link tweet about today's activity.  Skips if nothing found."""
     commits = _todays_git_commits()
     note = _todays_obsidian_snippet()
 
-    if not commits and not note:
+    tweet = _daily_tweet(commits, note)
+    if tweet is None:
         print("  No activity found — skipping daily post")
         return None
 
-    parts: list[str] = []
-
-    if commits:
-        # group by project
-        proj_counts: dict[str, int] = {}
-        for proj, _ in commits:
-            proj_counts[proj] = proj_counts.get(proj, 0) + 1
-        proj_str = " · ".join(
-            f"{c} commit{'s' if c > 1 else ''} in {p}"
-            for p, c in sorted(proj_counts.items(), key=lambda x: -x[1])[:3]
-        )
-        parts.append(f"Today's code: {proj_str}")
-
-    if note:
-        parts.append(note)
-
-    tweet = " 📝 ".join(parts)
-    if len(tweet) > 270:
-        tweet = tweet[:267] + "..."
-
-    print(f"  Tweet: {tweet[:80]}...")
+    print(f"  Tweet ({len(tweet)} chars): {tweet[:100]}...")
     if dry_run:
-        print(f"  [DRY RUN]")
+        print("  [DRY RUN]")
         return tweet
 
     ok, out = post_tweet(tweet)
     if ok:
         print(f"  ✓  {out}")
-        send_telegram(f"🐦 Daily update:\n\n{tweet}\n\n{out}")
+        send_telegram(f"🐦 Posted to X:\n\n{tweet}")
     else:
         print(f"  ✗  {out}")
-        send_telegram(f"🐦 Daily post FAILED:\n\n{out}")
+        send_telegram(f"🐦 Post FAILED:\n\n{out}")
     return tweet
 
 
 # ── scheduling ───────────────────────────────────────────────────────────────
 
 def schedule_posts() -> None:
-    """Pick 3 random time slots between 9:00 and 21:00 and schedule at(1) jobs."""
     os.makedirs(LOG_DIR, exist_ok=True)
-
     now = datetime.now()
     start = now.replace(hour=9, minute=0, second=0, microsecond=0)
     end = now.replace(hour=21, minute=0, second=0, microsecond=0)
 
-    # generate candidate times: every 15 minutes between start and end
     candidates: list[datetime] = []
     t = start
     while t <= end - timedelta(hours=1):
@@ -319,7 +395,6 @@ def schedule_posts() -> None:
         print("Not enough time slots left today", file=sys.stderr)
         return
 
-    # pick 3 times, at least 2 hours apart
     times: list[datetime] = []
     for _ in range(50):
         random.shuffle(candidates)
@@ -332,7 +407,6 @@ def schedule_posts() -> None:
             break
 
     if len(times) < 3:
-        # fallback: pick 3 random from candidates regardless of spacing
         times = sorted(random.sample(candidates, min(3, len(candidates))))
 
     modes = ["blog", "repo", "daily"]
@@ -349,8 +423,7 @@ def schedule_posts() -> None:
         )
         result = subprocess.run(
             ["at", time_str],
-            input=cmd,
-            capture_output=True, text=True, timeout=10,
+            input=cmd, capture_output=True, text=True, timeout=10,
         )
         if result.returncode == 0:
             print(f"Scheduled {mode} at {time_str}  →  {log_file}")
@@ -362,7 +435,7 @@ def schedule_posts() -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Kestrel Daily Posts — schedule or post a tweet",
+        description="Kestrel Daily Posts — schedule or post a tweet in Tim's voice",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=textwrap.dedent("""\
             examples:
@@ -374,8 +447,7 @@ def main() -> None:
         """),
     )
     parser.add_argument(
-        "--mode", choices=["schedule", "blog", "repo", "daily"],
-        default="schedule",
+        "--mode", choices=["schedule", "blog", "repo", "daily"], default="schedule",
     )
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
@@ -391,7 +463,6 @@ def main() -> None:
         do_repo(dry_run=args.dry_run)
     elif args.mode == "daily":
         do_daily(dry_run=args.dry_run)
-
     print()
 
 
