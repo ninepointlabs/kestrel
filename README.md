@@ -6,6 +6,16 @@ the CLI and the MCP server, keeps an agent from posting without bound.
 
 ## Install
 
+Linux packages (`.deb`, `.rpm`, Arch `.pkg.tar.zst`) are attached to each
+[GitHub release](https://github.com/ninepointlabs/kestrel/releases). To install and keep
+them updated with [autonomix-cli](https://github.com/ninepointlabs/autonomix-cli):
+
+```sh
+autonomix-cli add https://github.com/ninepointlabs/kestrel
+```
+
+### From source
+
 Requires a Rust toolchain with edition 2024 support (Rust 1.85+).
 
 ```sh
