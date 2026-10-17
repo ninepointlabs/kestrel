@@ -3,6 +3,6 @@ Version: @VERSION@
 Section: utils
 Priority: optional
 Architecture: amd64
-Maintainer: Ninepoint Labs
+Maintainer: Nine Point Labs
 Homepage: https://github.com/ninepointlabs/kestrel
 Description: Post to X from the CLI or via MCP server for AI agents
