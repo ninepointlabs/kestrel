@@ -12,7 +12,7 @@ cd "$(dirname "$0")/.."
 
 VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
 DESCRIPTION="Post to X from the CLI or via MCP server for AI agents"
-MAINTAINER="Ninepoint Labs"
+MAINTAINER="Nine Point Labs"
 URL="https://github.com/ninepointlabs/kestrel"
 
 cargo build --release
