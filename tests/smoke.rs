@@ -2,7 +2,7 @@
 //! `daily_limit = 0` keeps every post blocked, so no request ever reaches X.
 
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
 const BIN: &str = env!("CARGO_BIN_EXE_kestrel");
@@ -46,6 +46,18 @@ fn configure(home: &PathBuf, limit: u32) {
     );
 }
 
+/// Replace the `max_post_length` line `configure` wrote.
+fn set_max_post_length(home: &Path, value: &str) {
+    let path = home.join(".config/kestrel/config.toml");
+    let saved = std::fs::read_to_string(&path).unwrap();
+    assert!(saved.contains("max_post_length = \"auto\""), "{saved}");
+    let updated = saved.replace(
+        "max_post_length = \"auto\"",
+        &format!("max_post_length = {value}"),
+    );
+    std::fs::write(&path, updated).unwrap();
+}
+
 #[test]
 fn missing_config_gives_guidance() {
     let home = temp_home("noconfig");
@@ -65,6 +77,7 @@ fn configure_status_and_limit_refusal() {
     let saved = std::fs::read_to_string(&path).unwrap();
     assert!(saved.contains("api_key = \"k1234\""), "{saved}");
     assert!(saved.contains("daily_limit = 0"), "{saved}");
+    assert!(saved.contains("max_post_length = \"auto\""), "{saved}");
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -83,6 +96,49 @@ fn configure_status_and_limit_refusal() {
     assert!(!out.status.success());
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(err.contains("daily post limit reached"), "{err}");
+
+    // At the limit, `auto` refuses before looking up the subscription (no network).
+    let long = "a".repeat(281);
+    let out = kestrel(&home, &["post", &long], "");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("daily post limit reached"), "{err}");
+    assert!(!err.contains("subscription"), "{err}");
+    let _ = std::fs::remove_dir_all(home);
+}
+
+#[test]
+fn premium_setting_allows_long_posts() {
+    let home = temp_home("premium");
+    configure(&home, 0);
+    set_max_post_length(&home, "\"premium\"");
+
+    // Only the daily limit stops these, not their length.
+    for len in [281, 25_000] {
+        let text = "a".repeat(len);
+        let out = kestrel(&home, &["post", &text], "");
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(err.contains("daily post limit reached"), "{len}: {err}");
+    }
+    let out = kestrel(&home, &["post", &"a".repeat(25_001)], "");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("tweet is too long: 25001/25000"), "{err}");
+
+    // Re-running configure keeps the explicit setting.
+    configure(&home, 0);
+    let saved = std::fs::read_to_string(home.join(".config/kestrel/config.toml")).unwrap();
+    assert!(saved.contains("max_post_length = \"premium\""), "{saved}");
+    let _ = std::fs::remove_dir_all(home);
+}
+
+#[test]
+fn invalid_max_post_length_is_a_config_error() {
+    let home = temp_home("badlength");
+    configure(&home, 0);
+    set_max_post_length(&home, "\"huge\"");
+    let out = kestrel(&home, &["status"], "");
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("max_post_length must be"), "{err}");
     let _ = std::fs::remove_dir_all(home);
 }
 
@@ -112,12 +168,18 @@ fn post_with_missing_image_fails_before_network() {
 fn post_refuses_bad_input_before_network() {
     let home = temp_home("badinput");
     configure(&home, 5);
+    set_max_post_length(&home, "\"standard\"");
 
     let long = "a".repeat(281);
     let out = kestrel(&home, &["post", &long], "");
     assert!(!out.status.success());
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(err.contains("tweet is too long: 281/280"), "{err}");
+
+    let out = kestrel(&home, &["post", "   "], "");
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("tweet text is empty"), "{err}");
 
     let not_image = home.join("notes.png");
     std::fs::write(&not_image, "plain text, not a PNG").unwrap();

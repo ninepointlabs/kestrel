@@ -46,13 +46,12 @@ impl KestrelServer {
     /// Upload the optional image, then post under the daily limit.
     /// Caller must hold `post_lock`.
     async fn post(&self, args: &PostArgs) -> Result<(client::Tweet, crate::rate_limiter::State)> {
-        client::validate_text(&args.text)?;
+        // Don't spend a subscription lookup or an upload on a post the daily limit
+        // would refuse.
+        self.limiter.check()?;
+        self.client.check_text(&args.text).await?;
         let media_ids = match &args.image_path {
-            Some(path) => {
-                // Don't spend an upload on a post the daily limit would refuse.
-                self.limiter.check()?;
-                vec![self.client.upload_media(path).await?]
-            }
+            Some(path) => vec![self.client.upload_media(path).await?],
             None => Vec::new(),
         };
         client::post_with_limit(

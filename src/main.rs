@@ -40,16 +40,16 @@ async fn run(cli: Cli) -> Result<()> {
             image,
             reply_to,
         } => {
-            client::validate_text(&text)?;
             let config = Config::load()?;
+            client::validate_text(&text, config.max_post_length.fixed())?;
             let limiter = RateLimiter::new(config.daily_limit)?;
             let client = XClient::new(config)?;
+            // Don't spend a subscription lookup or an upload on a post the daily limit
+            // would refuse.
+            limiter.check()?;
+            client.check_text(&text).await?;
             let media_ids = match image {
-                Some(path) => {
-                    // Don't spend an upload on a post the daily limit would refuse.
-                    limiter.check()?;
-                    vec![client.upload_media(&path).await?]
-                }
+                Some(path) => vec![client.upload_media(&path).await?],
                 None => Vec::new(),
             };
             let (tweet, state) = client::post_with_limit(
@@ -106,6 +106,8 @@ fn configure() -> Result<()> {
             raw.parse()
                 .with_context(|| format!("daily limit must be a whole number, got {raw:?}"))?
         },
+        // Not prompted for: most people never change it, so keep what the file has.
+        max_post_length: ex.map(|c| c.max_post_length).unwrap_or_default(),
     };
 
     let path = config.save()?;
