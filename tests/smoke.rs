@@ -2,7 +2,7 @@
 //! `daily_limit = 0` keeps every post blocked, so no request ever reaches X.
 
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
 const BIN: &str = env!("CARGO_BIN_EXE_kestrel");
@@ -46,6 +46,18 @@ fn configure(home: &PathBuf, limit: u32) {
     );
 }
 
+/// Replace the `max_post_length` line `configure` wrote.
+fn set_max_post_length(home: &Path, value: &str) {
+    let path = home.join(".config/kestrel/config.toml");
+    let saved = std::fs::read_to_string(&path).unwrap();
+    assert!(saved.contains("max_post_length = \"auto\""), "{saved}");
+    let updated = saved.replace(
+        "max_post_length = \"auto\"",
+        &format!("max_post_length = {value}"),
+    );
+    std::fs::write(&path, updated).unwrap();
+}
+
 #[test]
 fn missing_config_gives_guidance() {
     let home = temp_home("noconfig");
@@ -65,6 +77,7 @@ fn configure_status_and_limit_refusal() {
     let saved = std::fs::read_to_string(&path).unwrap();
     assert!(saved.contains("api_key = \"k1234\""), "{saved}");
     assert!(saved.contains("daily_limit = 0"), "{saved}");
+    assert!(saved.contains("max_post_length = \"auto\""), "{saved}");
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -83,6 +96,49 @@ fn configure_status_and_limit_refusal() {
     assert!(!out.status.success());
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(err.contains("daily post limit reached"), "{err}");
+
+    // At the limit, `auto` refuses before looking up the subscription (no network).
+    let long = "a".repeat(281);
+    let out = kestrel(&home, &["post", &long], "");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("daily post limit reached"), "{err}");
+    assert!(!err.contains("subscription"), "{err}");
+    let _ = std::fs::remove_dir_all(home);
+}
+
+#[test]
+fn premium_setting_allows_long_posts() {
+    let home = temp_home("premium");
+    configure(&home, 0);
+    set_max_post_length(&home, "\"premium\"");
+
+    // Only the daily limit stops these, not their length.
+    for len in [281, 25_000] {
+        let text = "a".repeat(len);
+        let out = kestrel(&home, &["post", &text], "");
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(err.contains("daily post limit reached"), "{len}: {err}");
+    }
+    let out = kestrel(&home, &["post", &"a".repeat(25_001)], "");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("tweet is too long: 25001/25000"), "{err}");
+
+    // Re-running configure keeps the explicit setting.
+    configure(&home, 0);
+    let saved = std::fs::read_to_string(home.join(".config/kestrel/config.toml")).unwrap();
+    assert!(saved.contains("max_post_length = \"premium\""), "{saved}");
+    let _ = std::fs::remove_dir_all(home);
+}
+
+#[test]
+fn invalid_max_post_length_is_a_config_error() {
+    let home = temp_home("badlength");
+    configure(&home, 0);
+    set_max_post_length(&home, "\"huge\"");
+    let out = kestrel(&home, &["status"], "");
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("max_post_length must be"), "{err}");
     let _ = std::fs::remove_dir_all(home);
 }
 
@@ -109,6 +165,42 @@ fn post_with_missing_image_fails_before_network() {
 }
 
 #[test]
+fn post_refuses_bad_input_before_network() {
+    let home = temp_home("badinput");
+    configure(&home, 5);
+    set_max_post_length(&home, "\"standard\"");
+
+    let long = "a".repeat(281);
+    let out = kestrel(&home, &["post", &long], "");
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("tweet is too long: 281/280"), "{err}");
+
+    let out = kestrel(&home, &["post", "   "], "");
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("tweet text is empty"), "{err}");
+
+    let not_image = home.join("notes.png");
+    std::fs::write(&not_image, "plain text, not a PNG").unwrap();
+    let out = kestrel(
+        &home,
+        &["post", "hello", "--image", not_image.to_str().unwrap()],
+        "",
+    );
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("not a supported image"), "{err}");
+
+    let out = kestrel(&home, &["status"], "");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        "Posts today: 0/5 (0%)"
+    );
+    let _ = std::fs::remove_dir_all(home);
+}
+
+#[test]
 fn mcp_server_lists_tools_and_enforces_limit() {
     let home = temp_home("mcp");
     configure(&home, 0);
@@ -119,6 +211,7 @@ fn mcp_server_lists_tools_and_enforces_limit() {
         r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#,
         r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"kestrel_status","arguments":{}}}"#,
         r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"kestrel_post","arguments":{"text":"hi"}}}"#,
+        "this is not json",
     ];
 
     let mut child = Command::new(BIN)
@@ -140,6 +233,12 @@ fn mcp_server_lists_tools_and_enforces_limit() {
     let out = child.wait_with_output().unwrap();
     let stdout = String::from_utf8_lossy(&out.stdout);
     eprintln!("MCP transcript:\n{stdout}");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("post failed"), "{stderr}");
+    assert!(
+        !stderr.contains('\x1b'),
+        "ANSI codes in MCP log: {stderr:?}"
+    );
 
     let responses: Vec<serde_json::Value> = stdout
         .lines()
@@ -170,6 +269,12 @@ fn mcp_server_lists_tools_and_enforces_limit() {
         post_text.contains("daily post limit reached"),
         "{post_text}"
     );
+
+    let parse_error = responses
+        .iter()
+        .find(|r| r["error"]["code"] == -32700)
+        .expect("no parse error reply for invalid JSON");
+    assert_eq!(parse_error["id"], serde_json::Value::Null);
 
     let _ = std::fs::remove_dir_all(home);
 }

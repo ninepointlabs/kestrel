@@ -14,12 +14,29 @@ them updated with [autonomix-cli](https://github.com/ninepointlabs/autonomix-cli
 autonomix-cli add https://github.com/ninepointlabs/kestrel
 ```
 
+The packages install to `/usr/local/bin`, which needs root.
+
+### Without sudo (~/.local/bin)
+
+Extract the binary from the Arch package (it is a plain zstd tarball) into
+`~/.local/bin`:
+
+```sh
+mkdir -p ~/.local/bin
+curl -LO https://github.com/ninepointlabs/kestrel/releases/download/v0.1.1/kestrel-0.1.1-1-x86_64.pkg.tar.zst
+tar -xOf kestrel-0.1.1-1-x86_64.pkg.tar.zst usr/local/bin/kestrel > ~/.local/bin/kestrel
+chmod +x ~/.local/bin/kestrel
+```
+
+Or build from source into the same place with `cargo install --path . --root ~/.local`
+(see below). Make sure `~/.local/bin` is on your `PATH`.
+
 ### From source
 
 Requires a Rust toolchain with edition 2024 support (Rust 1.85+).
 
 ```sh
-git clone <this repo> ~/Projects/kestrel
+git clone https://github.com/ninepointlabs/kestrel.git ~/Projects/kestrel
 cd ~/Projects/kestrel
 cargo install --path .
 ```
@@ -55,7 +72,13 @@ access_token_secret = "YOUR_ACCESS_TOKEN_SECRET"
 
 # Daily post limit (default: 50)
 daily_limit = 50
+
+# Longest post Kestrel will send: "auto" (default), "premium", "standard", or a number
+max_post_length = "auto"
 ```
+
+`kestrel configure` doesn't ask about `max_post_length`. It keeps whatever the file
+already has, or writes `"auto"` for a new config.
 
 ## Usage
 
@@ -125,6 +148,30 @@ Usage is tracked in `~/.config/kestrel/state.json`:
 - `daily_limit` in `config.toml` is the source of truth. If you lower it, the new
   limit applies right away.
 
+## Post length
+
+X allows 280 characters per post, or 25,000 with X Premium. Characters are counted
+the way X counts them: each link is 23, and emoji and CJK characters are 2. Kestrel
+refuses an over-long post before calling X (or uploading an image), based on
+`max_post_length`:
+
+| Value | Limit |
+|-------|-------|
+| `"auto"` (default) | Ask X which subscription the account has: 25,000 for `Premium` or `PremiumPlus`, 280 for `Basic` or `None`. |
+| `"premium"` | 25,000 |
+| `"standard"` | 280 |
+| a number, e.g. `4000` | that many characters |
+
+With `"auto"`, Kestrel calls `GET /2/users/me?user.fields=subscription_type` and caches
+the answer in `~/.config/kestrel/account.json` for the rest of the day. The cache is
+tied to your access token, so switching accounts triggers a new check. The lookup is
+one more X API call per day, which X may bill. Set `max_post_length` explicitly to skip
+it. The lookup happens only after the daily limit check passes.
+
+If the lookup fails (network error, revoked token, an unknown subscription type),
+Kestrel prints a warning and posts anyway. X then accepts or rejects the post by
+its own length rule. Kestrel still refuses an empty post.
+
 ## MCP server
 
 `kestrel serve` speaks MCP (JSON-RPC over stdio). It identifies itself as `kestrel`
@@ -159,6 +206,8 @@ If the client does not inherit your `PATH`, use the full path, e.g.
 | `403 ... forbidden` | The app lacks Read and Write permission, the token was generated before the permission change, or the tweet is a duplicate. |
 | `429 ... rate limit hit` | X's own API rate limit, not Kestrel's daily limit. The message shows the reset time. |
 | `daily post limit reached` | Kestrel's daily limit. It resets tomorrow, or you can raise `daily_limit`. |
+| `tweet is too long: 281/280` | The post exceeds `max_post_length`. If you have X Premium but see 280, set `max_post_length = "premium"`. |
+| `could not check this account's X subscription` | The `"auto"` lookup failed. This is only a warning: the post still goes to X. |
 
 ## Development
 

@@ -4,7 +4,7 @@ mod config;
 mod mcp_server;
 mod rate_limiter;
 
-use std::io::{self, BufRead, Write};
+use std::io::{self, BufRead, IsTerminal, Write};
 
 use anyhow::{Context, Result, bail};
 use clap::Parser;
@@ -18,11 +18,13 @@ use crate::rate_limiter::RateLimiter;
 #[tokio::main]
 async fn main() {
     // Logs go to stderr: stdout carries the MCP protocol in `serve` mode.
+    // No colour codes unless stderr is a terminal (MCP clients capture it to a log).
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_env("KESTREL_LOG").unwrap_or_else(|_| EnvFilter::new("warn")),
         )
         .with_writer(io::stderr)
+        .with_ansi(io::stderr().is_terminal())
         .init();
 
     if let Err(e) = run(Cli::parse()).await {
@@ -39,14 +41,15 @@ async fn run(cli: Cli) -> Result<()> {
             reply_to,
         } => {
             let config = Config::load()?;
+            client::validate_text(&text, config.max_post_length.fixed())?;
             let limiter = RateLimiter::new(config.daily_limit)?;
             let client = XClient::new(config)?;
+            // Don't spend a subscription lookup or an upload on a post the daily limit
+            // would refuse.
+            limiter.check()?;
+            client.check_text(&text).await?;
             let media_ids = match image {
-                Some(path) => {
-                    // Don't spend an upload on a post the daily limit would refuse.
-                    limiter.check()?;
-                    vec![client.upload_media(&path).await?]
-                }
+                Some(path) => vec![client.upload_media(&path).await?],
                 None => Vec::new(),
             };
             let (tweet, state) = client::post_with_limit(
@@ -103,6 +106,8 @@ fn configure() -> Result<()> {
             raw.parse()
                 .with_context(|| format!("daily limit must be a whole number, got {raw:?}"))?
         },
+        // Not prompted for: most people never change it, so keep what the file has.
+        max_post_length: ex.map(|c| c.max_post_length).unwrap_or_default(),
     };
 
     let path = config.save()?;
