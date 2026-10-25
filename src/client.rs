@@ -17,6 +17,11 @@ use crate::rate_limiter::{RateLimiter, State};
 pub const TWEETS_URL: &str = "https://api.x.com/2/tweets";
 pub const MEDIA_UPLOAD_URL: &str = "https://upload.x.com/1.1/media/upload.json";
 
+/// X's limit for a standard (non-Premium) post, in weighted characters.
+pub const MAX_TWEET_LENGTH: usize = 280;
+/// X wraps every link in t.co, so each URL counts as this many characters.
+const URL_LENGTH: usize = 23;
+
 #[derive(Debug, Clone)]
 pub struct Tweet {
     pub id: String,
@@ -52,9 +57,7 @@ impl XClient {
         media_ids: Option<&[String]>,
         reply_to_id: Option<&str>,
     ) -> Result<Tweet> {
-        if text.trim().is_empty() {
-            bail!("tweet text is empty");
-        }
+        validate_text(text)?;
         if let Some(id) = reply_to_id {
             validate_tweet_id(id)?;
         }
@@ -111,18 +114,19 @@ impl XClient {
         if bytes.is_empty() {
             bail!("image file is empty: {image_path}");
         }
+        let Some(mime) = sniff_image_mime(&bytes) else {
+            bail!("not a supported image: {image_path} (expected PNG, JPEG, GIF, or WebP)");
+        };
 
         let file_name = path
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or("image")
             .to_owned();
-        let mut part = reqwest::multipart::Part::bytes(bytes).file_name(file_name);
-        if let Some(mime) = image_mime_type(path) {
-            part = part
-                .mime_str(mime)
-                .context("failed to set image content type")?;
-        }
+        let part = reqwest::multipart::Part::bytes(bytes)
+            .file_name(file_name)
+            .mime_str(mime)
+            .context("failed to set image content type")?;
         let form = reqwest::multipart::Form::new().part("media", part);
 
         let auth = authorization_header(
@@ -196,15 +200,79 @@ fn parse_media_id(body: &str) -> Result<String> {
     Ok(parsed.media_id_string)
 }
 
-fn image_mime_type(path: &Path) -> Option<&'static str> {
-    let ext = path.extension()?.to_str()?.to_ascii_lowercase();
-    match ext.as_str() {
-        "png" => Some("image/png"),
-        "jpg" | "jpeg" => Some("image/jpeg"),
-        "gif" => Some("image/gif"),
-        "webp" => Some("image/webp"),
-        _ => None,
+/// Identify an image by its magic bytes; these are the formats X accepts.
+fn sniff_image_mime(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        Some("image/png")
+    } else if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        Some("image/jpeg")
+    } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        Some("image/gif")
+    } else if bytes.len() >= 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WEBP" {
+        Some("image/webp")
+    } else {
+        None
     }
+}
+
+/// Refuse text X would reject (empty or over the length limit) before any API call.
+pub fn validate_text(text: &str) -> Result<()> {
+    if text.trim().is_empty() {
+        bail!("tweet text is empty");
+    }
+    let len = tweet_length(text);
+    if len > MAX_TWEET_LENGTH {
+        bail!(
+            "tweet is too long: {len}/{MAX_TWEET_LENGTH} characters as X counts them \
+             (each link counts as {URL_LENGTH}; emoji and CJK characters count as 2)"
+        );
+    }
+    Ok(())
+}
+
+/// Weighted length following X's counting rules (twitter-text v3), simplified:
+/// links count as [`URL_LENGTH`], Latin and most punctuation as 1, everything else
+/// (CJK, emoji, ...) as 2, and an emoji sequence (ZWJ, skin tone, flag) as one emoji.
+/// Only `http://` and `https://` links are recognised, and text is not NFC-normalised.
+pub fn tweet_length(text: &str) -> usize {
+    text.split_inclusive(char::is_whitespace)
+        .map(|word| {
+            let url = word.trim_end_matches(|c: char| {
+                c.is_whitespace()
+                    || matches!(c, '.' | ',' | ':' | ';' | '!' | '?' | ')' | '\'' | '"')
+            });
+            match url
+                .strip_prefix("https://")
+                .or_else(|| url.strip_prefix("http://"))
+            {
+                Some(rest) if !rest.is_empty() => URL_LENGTH + weighted_chars(&word[url.len()..]),
+                _ => weighted_chars(word),
+            }
+        })
+        .sum()
+}
+
+fn weighted_chars(s: &str) -> usize {
+    let mut len = 0;
+    let mut prev = None;
+    let mut half_flag = false;
+    for c in s.chars() {
+        len += match c {
+            // Modifiers and joined code points belong to the preceding emoji.
+            '\u{200D}' | '\u{FE0E}' | '\u{FE0F}' | '\u{1F3FB}'..='\u{1F3FF}' => 0,
+            _ if prev == Some('\u{200D}') => 0,
+            // A flag is a pair of regional indicators.
+            '\u{1F1E6}'..='\u{1F1FF}' if half_flag => 0,
+            '\u{0000}'..='\u{10FF}'
+            | '\u{2000}'..='\u{200D}'
+            | '\u{2010}'..='\u{201F}'
+            | '\u{2032}'..='\u{2037}' => 1,
+            _ => 2,
+        };
+        half_flag = matches!(c, '\u{1F1E6}'..='\u{1F1FF}') && !half_flag;
+        prev = Some(c);
+    }
+    len
 }
 
 /// Post while enforcing the daily limit: check, post, then count the post.
@@ -580,27 +648,91 @@ mod tests {
     }
 
     #[test]
-    fn image_mime_type_from_extension() {
-        assert_eq!(image_mime_type(Path::new("a/photo.PNG")), Some("image/png"));
-        assert_eq!(image_mime_type(Path::new("x.jpeg")), Some("image/jpeg"));
-        assert_eq!(image_mime_type(Path::new("noext")), None);
+    fn image_type_from_magic_bytes() {
+        assert_eq!(
+            sniff_image_mime(b"\x89PNG\r\n\x1a\n...."),
+            Some("image/png")
+        );
+        assert_eq!(
+            sniff_image_mime(&[0xFF, 0xD8, 0xFF, 0xE0]),
+            Some("image/jpeg")
+        );
+        assert_eq!(sniff_image_mime(b"GIF89a..."), Some("image/gif"));
+        assert_eq!(
+            sniff_image_mime(b"RIFF\0\0\0\0WEBPVP8 "),
+            Some("image/webp")
+        );
+        assert_eq!(sniff_image_mime(b"%PDF-1.7"), None);
+        assert_eq!(sniff_image_mime(b"hello"), None);
     }
 
-    #[tokio::test]
-    async fn upload_media_missing_file_is_clear_error() {
-        let config = Config {
+    #[test]
+    fn tweet_length_follows_x_counting() {
+        assert_eq!(tweet_length("hello world"), 11);
+        assert_eq!(tweet_length("café — “quoted”"), 15);
+        assert_eq!(tweet_length("日本語"), 6);
+        assert_eq!(
+            tweet_length("see https://example.com/a/very/long/path?q=1."),
+            4 + 23 + 1
+        );
+        assert_eq!(tweet_length("http://"), 7);
+        assert_eq!(tweet_length("👍"), 2);
+        assert_eq!(tweet_length("👍🏽"), 2);
+        assert_eq!(tweet_length("👨‍👩‍👧"), 2);
+        assert_eq!(tweet_length("🇬🇧🇫🇷"), 4);
+        assert_eq!(tweet_length("❤️"), 2);
+    }
+
+    #[test]
+    fn text_validation() {
+        assert!(validate_text(&"a".repeat(280)).is_ok());
+        assert!(validate_text(&"日".repeat(140)).is_ok());
+        let err = validate_text(&"a".repeat(281)).unwrap_err().to_string();
+        assert!(err.contains("too long: 281/280"), "{err}");
+        assert!(validate_text(&"日".repeat(141)).is_err());
+        assert!(
+            validate_text(&format!(
+                "{} https://example.com/{}",
+                "a".repeat(256),
+                "x".repeat(100)
+            ))
+            .is_ok()
+        );
+        assert!(validate_text("  ").is_err());
+    }
+
+    fn test_client() -> XClient {
+        XClient::new(Config {
             api_key: "ck".into(),
             api_secret: "cs".into(),
             access_token: "tk".into(),
             access_token_secret: "ts".into(),
             daily_limit: 50,
-        };
-        let client = XClient::new(config).unwrap();
-        let err = client
+        })
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn upload_media_missing_file_is_clear_error() {
+        let err = test_client()
             .upload_media("/nonexistent/kestrel-test.png")
             .await
             .unwrap_err()
             .to_string();
         assert!(err.contains("image file not found"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn upload_media_rejects_non_image_before_network() {
+        let path =
+            std::env::temp_dir().join(format!("kestrel-notimage-{}.png", std::process::id()));
+        std::fs::write(&path, "just some text").unwrap();
+        let err = test_client()
+            .upload_media(path.to_str().unwrap())
+            .await
+            .unwrap_err()
+            .to_string();
+        let _ = std::fs::remove_file(&path);
+        assert!(err.contains("not a supported image"), "{err}");
     }
 }

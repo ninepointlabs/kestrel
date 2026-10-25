@@ -4,7 +4,7 @@ mod config;
 mod mcp_server;
 mod rate_limiter;
 
-use std::io::{self, BufRead, Write};
+use std::io::{self, BufRead, IsTerminal, Write};
 
 use anyhow::{Context, Result, bail};
 use clap::Parser;
@@ -18,11 +18,13 @@ use crate::rate_limiter::RateLimiter;
 #[tokio::main]
 async fn main() {
     // Logs go to stderr: stdout carries the MCP protocol in `serve` mode.
+    // No colour codes unless stderr is a terminal (MCP clients capture it to a log).
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_env("KESTREL_LOG").unwrap_or_else(|_| EnvFilter::new("warn")),
         )
         .with_writer(io::stderr)
+        .with_ansi(io::stderr().is_terminal())
         .init();
 
     if let Err(e) = run(Cli::parse()).await {
@@ -38,6 +40,7 @@ async fn run(cli: Cli) -> Result<()> {
             image,
             reply_to,
         } => {
+            client::validate_text(&text)?;
             let config = Config::load()?;
             let limiter = RateLimiter::new(config.daily_limit)?;
             let client = XClient::new(config)?;

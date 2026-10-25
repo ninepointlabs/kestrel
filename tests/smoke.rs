@@ -109,6 +109,36 @@ fn post_with_missing_image_fails_before_network() {
 }
 
 #[test]
+fn post_refuses_bad_input_before_network() {
+    let home = temp_home("badinput");
+    configure(&home, 5);
+
+    let long = "a".repeat(281);
+    let out = kestrel(&home, &["post", &long], "");
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("tweet is too long: 281/280"), "{err}");
+
+    let not_image = home.join("notes.png");
+    std::fs::write(&not_image, "plain text, not a PNG").unwrap();
+    let out = kestrel(
+        &home,
+        &["post", "hello", "--image", not_image.to_str().unwrap()],
+        "",
+    );
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("not a supported image"), "{err}");
+
+    let out = kestrel(&home, &["status"], "");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        "Posts today: 0/5 (0%)"
+    );
+    let _ = std::fs::remove_dir_all(home);
+}
+
+#[test]
 fn mcp_server_lists_tools_and_enforces_limit() {
     let home = temp_home("mcp");
     configure(&home, 0);
@@ -119,6 +149,7 @@ fn mcp_server_lists_tools_and_enforces_limit() {
         r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#,
         r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"kestrel_status","arguments":{}}}"#,
         r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"kestrel_post","arguments":{"text":"hi"}}}"#,
+        "this is not json",
     ];
 
     let mut child = Command::new(BIN)
@@ -140,6 +171,12 @@ fn mcp_server_lists_tools_and_enforces_limit() {
     let out = child.wait_with_output().unwrap();
     let stdout = String::from_utf8_lossy(&out.stdout);
     eprintln!("MCP transcript:\n{stdout}");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("post failed"), "{stderr}");
+    assert!(
+        !stderr.contains('\x1b'),
+        "ANSI codes in MCP log: {stderr:?}"
+    );
 
     let responses: Vec<serde_json::Value> = stdout
         .lines()
@@ -170,6 +207,12 @@ fn mcp_server_lists_tools_and_enforces_limit() {
         post_text.contains("daily post limit reached"),
         "{post_text}"
     );
+
+    let parse_error = responses
+        .iter()
+        .find(|r| r["error"]["code"] == -32700)
+        .expect("no parse error reply for invalid JSON");
+    assert_eq!(parse_error["id"], serde_json::Value::Null);
 
     let _ = std::fs::remove_dir_all(home);
 }
