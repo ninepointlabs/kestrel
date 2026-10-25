@@ -14,12 +14,29 @@ them updated with [autonomix-cli](https://github.com/ninepointlabs/autonomix-cli
 autonomix-cli add https://github.com/ninepointlabs/kestrel
 ```
 
+The packages install to `/usr/local/bin`, which needs root.
+
+### Without sudo (~/.local/bin)
+
+Extract the binary from the Arch package (it is a plain zstd tarball) into
+`~/.local/bin`:
+
+```sh
+mkdir -p ~/.local/bin
+curl -LO https://github.com/ninepointlabs/kestrel/releases/download/v0.1.1/kestrel-0.1.1-1-x86_64.pkg.tar.zst
+tar -xOf kestrel-0.1.1-1-x86_64.pkg.tar.zst usr/local/bin/kestrel > ~/.local/bin/kestrel
+chmod +x ~/.local/bin/kestrel
+```
+
+Or build from source into the same place with `cargo install --path . --root ~/.local`
+(see below). Make sure `~/.local/bin` is on your `PATH`.
+
 ### From source
 
 Requires a Rust toolchain with edition 2024 support (Rust 1.85+).
 
 ```sh
-git clone <this repo> ~/Projects/kestrel
+git clone https://github.com/ninepointlabs/kestrel.git ~/Projects/kestrel
 cd ~/Projects/kestrel
 cargo install --path .
 ```
