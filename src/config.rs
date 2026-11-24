@@ -2,9 +2,12 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 
 pub const DEFAULT_DAILY_LIMIT: u32 = 50;
+/// X's post length limits, in weighted characters.
+pub const STANDARD_POST_LENGTH: usize = 280;
+pub const PREMIUM_POST_LENGTH: usize = 25_000;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
@@ -14,6 +17,71 @@ pub struct Config {
     pub access_token_secret: String,
     #[serde(default = "default_daily_limit")]
     pub daily_limit: u32,
+    #[serde(default)]
+    pub max_post_length: MaxPostLength,
+}
+
+/// The `max_post_length` setting: `"auto"`, `"premium"`, `"standard"`, or a number.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MaxPostLength {
+    /// Ask X for the account's subscription type (see `XClient::max_post_length`).
+    #[default]
+    Auto,
+    Premium,
+    Standard,
+    Chars(usize),
+}
+
+impl MaxPostLength {
+    /// The limit when set explicitly; `None` for `Auto`.
+    pub fn fixed(self) -> Option<usize> {
+        match self {
+            Self::Auto => None,
+            Self::Premium => Some(PREMIUM_POST_LENGTH),
+            Self::Standard => Some(STANDARD_POST_LENGTH),
+            Self::Chars(n) => Some(n),
+        }
+    }
+}
+
+impl Serialize for MaxPostLength {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Auto => s.serialize_str("auto"),
+            Self::Premium => s.serialize_str("premium"),
+            Self::Standard => s.serialize_str("standard"),
+            Self::Chars(n) => s.serialize_u64(*n as u64),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for MaxPostLength {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Raw {
+            Chars(i64),
+            Name(String),
+        }
+        let invalid = |got: &dyn std::fmt::Debug| {
+            de::Error::custom(format!(
+                "max_post_length must be \"auto\", \"premium\", \"standard\", \
+                 or a positive number, got {got:?}"
+            ))
+        };
+        match Raw::deserialize(d)? {
+            Raw::Chars(n) => match usize::try_from(n) {
+                Ok(n) if n > 0 => Ok(Self::Chars(n)),
+                _ => Err(invalid(&n)),
+            },
+            Raw::Name(name) => match name.to_ascii_lowercase().as_str() {
+                "auto" => Ok(Self::Auto),
+                "premium" => Ok(Self::Premium),
+                "standard" => Ok(Self::Standard),
+                _ => Err(invalid(&name)),
+            },
+        }
+    }
 }
 
 fn default_daily_limit() -> u32 {
@@ -112,7 +180,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn daily_limit_defaults_to_50() {
+    fn defaults_for_optional_settings() {
         let config: Config = toml::from_str(
             r#"
             api_key = "a"
@@ -123,6 +191,30 @@ mod tests {
         )
         .unwrap();
         assert_eq!(config.daily_limit, 50);
+        assert_eq!(config.max_post_length, MaxPostLength::Auto);
+    }
+
+    #[test]
+    fn parses_max_post_length() {
+        let parse = |value: &str| {
+            toml::from_str::<Config>(&format!(
+                "api_key = \"a\"\napi_secret = \"b\"\naccess_token = \"c\"\n\
+                 access_token_secret = \"d\"\nmax_post_length = {value}\n"
+            ))
+            .map(|c| c.max_post_length)
+            .map_err(|e| e.to_string())
+        };
+        assert_eq!(parse("\"auto\""), Ok(MaxPostLength::Auto));
+        assert_eq!(parse("\"Premium\""), Ok(MaxPostLength::Premium));
+        assert_eq!(parse("\"standard\""), Ok(MaxPostLength::Standard));
+        assert_eq!(parse("4000"), Ok(MaxPostLength::Chars(4000)));
+        assert_eq!(MaxPostLength::Premium.fixed(), Some(25_000));
+        assert_eq!(MaxPostLength::Standard.fixed(), Some(280));
+        assert_eq!(MaxPostLength::Auto.fixed(), None);
+        for bad in ["\"huge\"", "0", "-5"] {
+            let err = parse(bad).unwrap_err();
+            assert!(err.contains("max_post_length must be"), "{bad}: {err}");
+        }
     }
 
     #[test]
@@ -151,10 +243,21 @@ mod tests {
             access_token: "c".into(),
             access_token_secret: "d".into(),
             daily_limit: 7,
+            max_post_length: MaxPostLength::Chars(280),
         };
         config.save_to(&path).unwrap();
         let loaded = Config::load_from(&path).unwrap();
         assert_eq!(loaded.daily_limit, 7);
+        assert_eq!(loaded.max_post_length, MaxPostLength::Chars(280));
+        for setting in [MaxPostLength::Auto, MaxPostLength::Premium] {
+            Config {
+                max_post_length: setting,
+                ..config.clone()
+            }
+            .save_to(&path)
+            .unwrap();
+            assert_eq!(Config::load_from(&path).unwrap().max_post_length, setting);
+        }
         assert_eq!(loaded.access_token_secret, "d");
         fs::remove_dir_all(&dir).unwrap();
     }
